@@ -27,6 +27,7 @@ class BorrowerSerializer(serializers.ModelSerializer):
 
 class PublicBorrowerApplicationSerializer(serializers.ModelSerializer):
     class Meta:
+        model = Borrower
         fields = (
             "first_name",
             "last_name",

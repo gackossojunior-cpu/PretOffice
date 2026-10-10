@@ -5,5 +5,5 @@ class PreteursConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = 'preteurs'
 
-    def reply(self):
+    def ready(self):
         import preteurs.signals

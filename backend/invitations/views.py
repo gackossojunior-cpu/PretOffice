@@ -1,125 +1,182 @@
-from django.shortcuts import render
+from django.db import transaction
 from django.utils import timezone
-from datetime import timedelta
-from rest_framework import generics
-from rest_framework.permissions import IsAuthenticated, AllowAny
-from .models import Invitations
-from .serializers import InvitationSerializer, PublicInvitationSerializer
+from drf_spectacular.utils import extend_schema
+from rest_framework import generics, status
+from rest_framework.exceptions import NotFound
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+
+from config.mixins import LenderScopedQuerysetMixin
+from audit.services import record_audit_event
 from emprunteurs.models import Borrower
 from emprunteurs.serializers import PublicBorrowerApplicationSerializer
-from rest_framework.response import Response
+from preteurs.permissions import HasLenderProfile
 
-class InvitationListCreateView(generics.ListCreateAPIView):
+from .models import Invitations
+from .serializers import (
+    InvitationRevokeResponseSerializer,
+    InvitationSerializer,
+    PublicInvitationSerializer,
+)
+
+
+INVALID_INVITATION_MESSAGE = "Cette invitation n'est pas valide."
+
+
+class InvitationListCreateView(
+    LenderScopedQuerysetMixin,
+    generics.ListCreateAPIView,
+):
     serializer_class = InvitationSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        return Invitations.objects.filter(lender=self.request.user).order_by("-created_at")
+    permission_classes = [IsAuthenticated, HasLenderProfile]
+    queryset = Invitations.objects.all()
+    query_filter_fields = {
+        "status": "status",
+        "created_after": "created_at__date__gte",
+        "created_before": "created_at__date__lte",
+        "expires_after": "expires_at__date__gte",
+        "expires_before": "expires_at__date__lte",
+    }
+    ordering_fields = ("created_at", "expires_at", "status", "id")
+    default_ordering = ("-created_at",)
 
     def perform_create(self, serializer):
-        serializer.save(
-            lender=self.request.user,
-            expires_at=timezone.now() + timedelta(days=7),
+        serializer.save(lender=self.request.user)
+
+
+class InvitationDetailView(
+    LenderScopedQuerysetMixin,
+    generics.RetrieveAPIView,
+):
+    serializer_class = InvitationSerializer
+    permission_classes = [IsAuthenticated, HasLenderProfile]
+    queryset = Invitations.objects.all()
+
+
+class InvitationRevokeView(
+    LenderScopedQuerysetMixin,
+    generics.GenericAPIView,
+):
+    permission_classes = [IsAuthenticated, HasLenderProfile]
+    queryset = Invitations.objects.all()
+    serializer_class = InvitationRevokeResponseSerializer
+
+    @transaction.atomic
+    @extend_schema(
+        request=None,
+        responses=InvitationRevokeResponseSerializer,
+    )
+    def post(self, request, pk):
+        try:
+            invitation = self.get_queryset().select_for_update().get(pk=pk)
+        except Invitations.DoesNotExist as exc:
+            raise NotFound("Invitation introuvable.") from exc
+
+        if invitation.status != "PENDING":
+            return Response(
+                {"detail": "Cette invitation ne peut plus être révoquée."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        invitation.status = "REVOKED"
+        invitation.save(update_fields=["status"])
+        record_audit_event(
+            request.user,
+            "INVITATION_REVOKED",
+            invitation,
         )
+        return Response(
+            {"detail": "Invitation révoquée."},
+            status=status.HTTP_200_OK,
+        )
+
 
 class PublicInvitationDetailView(generics.RetrieveAPIView):
     serializer_class = PublicInvitationSerializer
     permission_classes = [AllowAny]
-    
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "public_invitation"
     lookup_field = "token"
-    lookup_url_kwargs = "token"
+    lookup_url_kwarg = "token"
+    queryset = Invitations.objects.all()
 
-    def get_queryset(self):
-        return Invitations.objects.all()
+    def get_object(self):
+        try:
+            invitation = Invitations.objects.get(token=self.kwargs["token"])
+        except Invitations.DoesNotExist as exc:
+            raise NotFound(INVALID_INVITATION_MESSAGE) from exc
 
-    def retrieve(self, request, *args, **kwargs):
-        invitation = self.get_object()
+        if (
+            invitation.status == "PENDING"
+            and timezone.now() >= invitation.expires_at
+        ):
+            invitation.status = "EXPIRED"
+            invitation.save(update_fields=["status"])
 
-        if invitation.status == "ACTIVE":
-            if timezone.now() >= invitation.expires_at:
-                invitation.status = "EXPIRED"
-                invitation.save(update_fields=["status"])
+        if invitation.status != "PENDING":
+            raise NotFound(INVALID_INVITATION_MESSAGE)
 
-        if invitation.status != "ACTIVE":
-            return Response(
-                {
-                    "detail": "Cette invitation n'est plus valide.",
-                    "status": invitation.status,
-                },
-                status=400,
-            )
-        
-        serializer = self.get_serializer(invitation)
+        return invitation
 
-        return Response(serializer.data)
+    def post(self, request, *args, **kwargs):
+        return submit_public_application(request, self.kwargs["token"])
+
 
 class PublicInvitationApplicationView(generics.CreateAPIView):
     serializer_class = PublicBorrowerApplicationSerializer
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "public_invitation"
 
     def create(self, request, *args, **kwargs):
-        token = kwargs.get("token")
+        return submit_public_application(request, kwargs["token"])
 
-        try:
-            invitation = Invitations.objects.get(token=token)
-        except Invitations.DoesNotExist:
-            return Response(
-                {
-                    "detail": "Cette invitation n'existe pas."
-                },
-                status=404,
-            )
 
-        if invitation.status != "ACTIVE":
-            return Response(
-                {
-                    "detail": "Cette invitation n'est plus valide.",
-                    "status": invitation.status,
-                },
-                status=400,
-            )
+@transaction.atomic
+def submit_public_application(request, token):
+    try:
+        invitation = Invitations.objects.select_for_update().get(token=token)
+    except Invitations.DoesNotExist:
+        raise NotFound(INVALID_INVITATION_MESSAGE)
 
-        if timezone.now() >= invitation.expires_at:
-            invitation.status = "EXPIRED"
-            invitation.save(update_fields=["status"])
+    if (
+        invitation.status == "PENDING"
+        and timezone.now() >= invitation.expires_at
+    ):
+        invitation.status = "EXPIRED"
+        invitation.save(update_fields=["status"])
 
-            return Response(
-                {
-                    "detail": "Cette invitation a expiré."
-                },
-                status=400,
-            )
-        
-        if invitation.borrower is not None:
-            return Response(
-                {
-                    "detail": "Cette invitation a déjà été utilisée."
-                },
-                status=400,
-            )
+    if invitation.status != "PENDING":
+        raise NotFound(INVALID_INVITATION_MESSAGE)
 
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+    serializer = PublicBorrowerApplicationSerializer(
+        data=request.data,
+        context={"request": request},
+    )
+    serializer.is_valid(raise_exception=True)
 
-        borrower = serializer.save(
-            lender=invitation.lender
-        )
+    used_at = timezone.now()
+    claimed = Invitations.objects.filter(
+        pk=invitation.pk,
+        status="PENDING",
+        expires_at__gt=used_at,
+    ).update(
+        status="USED",
+        used_at=used_at,
+    )
+    if claimed != 1:
+        raise NotFound(INVALID_INVITATION_MESSAGE)
 
-        invitation.borrower = borrower
-        invitation.status = "USED"
-        invitation.used_at = timezone.now()
-        invitation.save(
-            update_fields=[
-                "borrower",
-                "status",
-                "used_at",
-            ]
-        )
+    borrower: Borrower = serializer.save(lender=invitation.lender)
 
-        return Response(
-            {
-                "detail": "Votre demande a été enregistrée avec succès.",
-                "borrower_id": borrower.id,
-            },
-            status=201,
-        )
+    invitation.borrower = borrower
+    invitation.save(update_fields=["borrower"])
+
+    return Response(
+        {
+            "detail": "Votre demande a été enregistrée avec succès.",
+            "borrower_id": borrower.pk,
+        },
+        status=status.HTTP_201_CREATED,
+    )

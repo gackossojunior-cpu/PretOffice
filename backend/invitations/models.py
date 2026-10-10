@@ -1,13 +1,20 @@
 from django.db import models
-
 import secrets
+from datetime import timedelta
 from django.conf import settings
 from django.utils import timezone
 from emprunteurs.models import Borrower
 
+
+def default_invitation_expiry():
+    return timezone.now() + timedelta(
+        days=getattr(settings, "INVITATION_TTL_DAYS", 7)
+    )
+
+
 class Invitations(models.Model):
     STATUS_CHOICES = (
-        ("ACTIVE", "Active"),
+        ("PENDING", "En attente"),
         ("USED", "Utilisée"),
         ("EXPIRED", "Expirée"),
         ("REVOKED", "Révoquée"),
@@ -29,10 +36,10 @@ class Invitations(models.Model):
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        default="ACTIVE",
+        default="PENDING",
     )
 
-    expires_at = models.DateTimeField()
+    expires_at = models.DateTimeField(default=default_invitation_expiry)
 
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -49,7 +56,7 @@ class Invitations(models.Model):
 
     @property
     def is_valid(self):
-        if self.status != "ACTIVE":
+        if self.status != "PENDING":
             return False
 
         if timezone.now() >= self.expires_at:
